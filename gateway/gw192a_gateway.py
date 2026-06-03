@@ -272,6 +272,51 @@ def probe_device(device: int, backend: str = "auto", attempts: int = 30) -> None
     cap.release()
 
 
+def preview_device(device: int, backend: str = "auto") -> None:
+    """Open a device and show its live frames in a local window (Windows-friendly).
+
+    This proves the camera works and lets you SEE the live thermal image even when
+    Windows/OpenCV cannot expose calibrated radiometric data. We auto-stretch the contrast
+    and apply a thermal colormap so the scene is clearly visible. Press 'q' or ESC to quit.
+    """
+    if cv2 is None:
+        print("OpenCV not installed; cannot preview.")
+        return
+    api = resolve_backend(backend)
+    cap = cv2.VideoCapture(device, api)
+    if not cap.isOpened():
+        print(f"[preview] no se pudo abrir el dispositivo {device} con backend '{backend}'. "
+              f"Prueba --backend dshow / any.")
+        return
+    print("[preview] Mostrando la camara en vivo. Apunta a tu mano o cara. "
+          "Pulsa 'q' o ESC en la ventana para salir.")
+    fails = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            fails += 1
+            if fails == 30:
+                print("[preview] no llegan frames; prueba --backend any o reconecta la camara.")
+            time.sleep(0.05)
+            continue
+        fails = 0
+        img = np.asarray(frame)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        # auto-stretch contrast so the thermal scene pops regardless of the raw format
+        norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        colored = cv2.applyColorMap(norm, cv2.COLORMAP_INFERNO)
+        scale = max(1, int(480 / max(1, colored.shape[0])))
+        big = cv2.resize(colored, (colored.shape[1] * scale, colored.shape[0] * scale),
+                         interpolation=cv2.INTER_NEAREST)
+        cv2.imshow("ThermoBaby - vista en vivo (pulsa q para salir)", big)
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+    print("[preview] cerrado.")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="GW192A desktop capture gateway")
     p.add_argument("--server", default="ws://localhost:8000", help="backend ws base URL")
@@ -289,6 +334,8 @@ def main() -> int:
     p.add_argument("--list", action="store_true", help="enumerate video devices and exit")
     p.add_argument("--probe", action="store_true",
                    help="open --device and report the real frame format, then exit")
+    p.add_argument("--preview", action="store_true",
+                   help="show the camera live in a local window (contrast-stretched thermal view)")
     args = p.parse_args()
 
     if args.list:
@@ -296,6 +343,9 @@ def main() -> int:
         return 0
     if args.probe:
         probe_device(args.device, backend=args.backend)
+        return 0
+    if args.preview:
+        preview_device(args.device, backend=args.backend)
         return 0
     try:
         asyncio.run(stream(args))
