@@ -43,9 +43,18 @@ gw192a-thermal/
 ├── docs/                      ← architecture, research, platform strategies, risks
 ├── backend/                   ← FastAPI + OpenCV + NumPy thermal server (REST + WS)
 ├── gateway/                   ← Desktop GW192A capture gateway (Win/Linux/macOS)
+├── android-bridge/            ← Native Android app (THG Start replica): USB-OTG → temperature → WS
 ├── frontend/                  ← Next.js + React + TS + Tailwind PWA
 └── validate/                  ← dependency-free runnable proof of the core math
 ```
+
+### Android bridge (replicating THG Start)
+
+`android-bridge/` is a native Android app that reads the GW192A over **USB-OTG** using a UVC
+engine (`libausbc`), recovers the **radiometric temperature** from the raw double-height frame
+(the browser cannot do this), shows it on the phone, and can forward frames to the ThermoBaby
+server over WebSocket. Build it with **Android Studio**; see
+[`android-bridge/README.md`](android-bridge/README.md).
 
 ## Quickstart
 

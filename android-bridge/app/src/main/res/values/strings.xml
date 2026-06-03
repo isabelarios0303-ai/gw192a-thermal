@@ -1,0 +1,21 @@
+<resources>
+    <string name="app_name">ThermoBaby Bridge</string>
+    <string name="title">Puente termico GW192A</string>
+    <string name="start_camera">Abrir camara termica</string>
+    <string name="connect">Conectar al servidor</string>
+    <string name="disconnect">Desconectar</string>
+    <string name="server_hint">ws://IP-DE-TU-PC:8000</string>
+
+    <string name="status_idle">Listo. Conecta la GW192A por USB-C y pulsa \"Abrir camara termica\".</string>
+    <string name="status_camera_hint">Integra aqui el callback UVC de libausbc (ver comentarios // AJUSTAR en MainActivity).</string>
+
+    <string name="readout_fmt">Max: %1$.1f C   Min: %2$.1f C   Prom: %3$.1f C</string>
+
+    <string name="alert_ok">Temperatura normal</string>
+    <string name="alert_warn_high">Temperatura elevada (posible fiebre)</string>
+    <string name="alert_warn_low">Hipotermia potencial</string>
+    <string name="alert_crit_high">Temperatura critica</string>
+    <string name="alert_crit_low">Temperatura critica (hipotermia)</string>
+
+    <string name="err_no_url">Escribe la URL del servidor (ej. ws://192.168.1.50:8000)</string>
+</resources>

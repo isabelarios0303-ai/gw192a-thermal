@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Match USB Video Class (UVC) devices. The GW192A enumerates as a standard UVC camera.
+  USB class 14 (0x0E) = Video. Using the class match catches the camera without hardcoding a
+  specific vendor/product id (which varies across GW192A batches). If you know your unit's exact
+  ids, you can add a <usb-device vendor-id="..." product-id="..."/> line for a tighter match.
+-->
+<resources>
+    <usb-device class="239" subclass="2" />  <!-- Miscellaneous / Interface Association (UVC composite) -->
+    <usb-device class="14" />                <!-- Video class (UVC) -->
+</resources>
