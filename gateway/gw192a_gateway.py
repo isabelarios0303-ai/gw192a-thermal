@@ -97,12 +97,16 @@ class GW192ACapture:
     """Wraps a UVC capture and yields radiometric Celsius matrices."""
 
     def __init__(self, device: int, width: int, height: int, backend: str = "auto",
-                 raw_yuyv: bool = True):
+                 raw_yuyv: bool = True, image_mode: bool = False,
+                 img_tmin: float = 20.0, img_tmax: float = 38.0):
         if cv2 is None:
             raise RuntimeError("OpenCV is required for camera capture (pip install opencv-python)")
         self.device = device
         self.sensor_w = width
         self.sensor_h = height
+        self.image_mode = image_mode
+        self.img_tmin = img_tmin
+        self.img_tmax = img_tmax
         api = resolve_backend(backend)
         self.cap = cv2.VideoCapture(device, api)
         if not self.cap.isOpened():
@@ -111,27 +115,49 @@ class GW192ACapture:
                 f"Try --backend dshow (Windows), msmf, any, or v4l2 (Linux)."
             )
 
-        # Try to request raw YUYV at DOUBLE height and disable RGB conversion so the radiometric
-        # half survives. Some backends silently ignore these; we report what we actually got.
-        if raw_yuyv:
+        # In image mode we WANT the OS to give us the normal (color) image, so we leave RGB
+        # conversion on. In radiometric mode we request raw YUYV at DOUBLE height and disable RGB
+        # conversion so the radiometric half survives (works mainly on Linux/V4L2).
+        if not image_mode and raw_yuyv:
             self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height * 2)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height * 2)
 
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"[gateway] capture opened (backend={backend}): "
-              f"requested {width}x{height * 2}, actual {actual_w}x{actual_h}")
-        if actual_h < height * 2:
-            print("[gateway] WARNING: device did not provide the double-height frame. "
-                  "Run with --probe to inspect the real frame, or try --backend dshow/msmf.")
+        mode = "IMAGEN (aprox.)" if image_mode else "radiométrico"
+        print(f"[gateway] capture opened (backend={backend}, modo={mode}): "
+              f"actual {actual_w}x{actual_h}")
+        if not image_mode and actual_h < height * 2:
+            print("[gateway] AVISO: el dispositivo no entregó el frame de doble altura. "
+                  "En Windows esto es normal: usa --image-mode para ver la imagen en vivo, "
+                  "o usa Linux para temperatura calibrada. (Ver docs/06-risks.md)")
 
     def read_celsius(self) -> np.ndarray | None:
         ok, frame = self.cap.read()
         if not ok or frame is None:
             return None
+        if self.image_mode:
+            return self._frame_to_pseudo_celsius(frame)
         return self._frame_to_celsius(frame)
+
+    def _frame_to_pseudo_celsius(self, frame: np.ndarray) -> np.ndarray:
+        """Image mode: turn the camera's normal (color) thermal picture into a moving,
+        UNCALIBRATED pseudo-temperature matrix so the web dashboard shows the live scene.
+
+        We take the visible thermal picture (top half if the frame looks double-height),
+        convert to grayscale, contrast-stretch, and map brightness -> [img_tmin, img_tmax].
+        Values are RELATIVE/approximate, not clinical temperatures.
+        """
+        img = np.asarray(frame)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        h = gray.shape[0]
+        # If clearly portrait/tall, the top portion is usually the visible image.
+        if h >= 2 * self.sensor_h:
+            gray = gray[: self.sensor_h, :]
+        norm = cv2.normalize(gray, None, 0.0, 1.0, cv2.NORM_MINMAX).astype(np.float32)
+        return (self.img_tmin + norm * (self.img_tmax - self.img_tmin)).astype(np.float32)
 
     def _frame_to_celsius(self, frame: np.ndarray) -> np.ndarray:
         """Interpret the raw buffer: the bottom half holds 16-bit radiometric data.
@@ -175,7 +201,9 @@ async def stream(args: argparse.Namespace) -> None:
     url = f"{args.server.rstrip('/')}/ws/ingest/{args.session}"
     cap: GW192ACapture | None = None
     if not args.simulate:
-        cap = GW192ACapture(args.device, args.width, args.height, backend=args.backend)
+        cap = GW192ACapture(args.device, args.width, args.height, backend=args.backend,
+                            image_mode=args.image_mode,
+                            img_tmin=args.img_tmin, img_tmax=args.img_tmax)
 
     backoff = 1.0
     seq = 0
@@ -305,7 +333,9 @@ def preview_device(device: int, backend: str = "auto") -> None:
         # auto-stretch contrast so the thermal scene pops regardless of the raw format
         norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         colored = cv2.applyColorMap(norm, cv2.COLORMAP_INFERNO)
-        scale = max(1, int(480 / max(1, colored.shape[0])))
+        # scale up to a comfortable window (target ~640px tall, minimum 4x)
+        target_h = 640
+        scale = max(4, int(target_h / max(1, colored.shape[0])))
         big = cv2.resize(colored, (colored.shape[1] * scale, colored.shape[0] * scale),
                          interpolation=cv2.INTER_NEAREST)
         cv2.imshow("ThermoBaby - vista en vivo (pulsa q para salir)", big)
@@ -330,6 +360,13 @@ def main() -> int:
                    help="OpenCV capture backend (auto picks dshow on Windows)")
     p.add_argument("--send-raw", action="store_true",
                    help="send radiometric uint16 instead of Celsius float32")
+    p.add_argument("--image-mode", action="store_true",
+                   help="Windows-friendly: stream the camera's VISIBLE thermal image to the web "
+                        "as approximate (uncalibrated) temperatures, so the dashboard shows live")
+    p.add_argument("--img-tmin", type=float, default=20.0,
+                   help="image-mode: temperature mapped to the darkest pixel (default 20C)")
+    p.add_argument("--img-tmax", type=float, default=38.0,
+                   help="image-mode: temperature mapped to the brightest pixel (default 38C)")
     p.add_argument("--simulate", action="store_true", help="emit a synthetic body (no hardware)")
     p.add_argument("--list", action="store_true", help="enumerate video devices and exit")
     p.add_argument("--probe", action="store_true",
