@@ -11,10 +11,15 @@ claim it while the OS camera stack holds it, and the OS will color-convert the r
 unless we explicitly request raw YUYV (V4L2: CAP_PROP_CONVERT_RGB=0). This native helper does
 that correctly and pushes normalized frames to the server. See docs/01-gw192a-research.md.
 
+Windows note: OpenCV defaults to the MSMF backend, which frequently fails to grab frames from
+cheap UVC thermal cameras ("can't grab frame. Error: -2147483638"). Use --backend dshow
+(DirectShow) on Windows, which is the default of this tool on win32.
+
 Usage:
-  python gw192a_gateway.py --server ws://localhost:8000 --session demo --device 0
-  python gw192a_gateway.py --list                 # enumerate candidate devices
-  python gw192a_gateway.py --simulate             # no camera: emit a synthetic warm body
+  python gw192a_gateway.py --server ws://localhost:8000 --session demo --device 1
+  python gw192a_gateway.py --list                       # enumerate candidate devices
+  python gw192a_gateway.py --probe --device 1           # diagnose what a device delivers
+  python gw192a_gateway.py --simulate                   # no camera: synthetic warm body
 """
 from __future__ import annotations
 
@@ -42,6 +47,25 @@ KIND_CELSIUS_F32 = 2
 # ---- GW192A radiometric constants (keep in sync with backend config) -----------------
 KELVIN_SCALE = 64.0
 KELVIN_OFFSET = 273.15
+
+
+def resolve_backend(name: str) -> int:
+    """Map a backend name to an OpenCV VideoCapture API preference constant."""
+    if cv2 is None:
+        return 0
+    if name == "auto":
+        if sys.platform.startswith("win"):
+            return cv2.CAP_DSHOW          # MSMF is unreliable for UVC thermal cams on Windows
+        if sys.platform == "darwin":
+            return cv2.CAP_AVFOUNDATION
+        return cv2.CAP_V4L2
+    return {
+        "dshow": cv2.CAP_DSHOW,
+        "msmf": cv2.CAP_MSMF,
+        "any": cv2.CAP_ANY,
+        "v4l2": cv2.CAP_V4L2,
+        "avfoundation": cv2.CAP_AVFOUNDATION,
+    }.get(name, cv2.CAP_ANY)
 
 
 def raw_to_celsius(raw: np.ndarray, gain: float = 1.0, offset: float = 0.0) -> np.ndarray:
@@ -72,30 +96,36 @@ def pack_radiometric_frame(raw_u16: np.ndarray, seq: int) -> bytes:
 class GW192ACapture:
     """Wraps a UVC capture and yields radiometric Celsius matrices."""
 
-    def __init__(self, device: int, width: int, height: int):
+    def __init__(self, device: int, width: int, height: int, backend: str = "auto",
+                 raw_yuyv: bool = True):
         if cv2 is None:
             raise RuntimeError("OpenCV is required for camera capture (pip install opencv-python)")
         self.device = device
         self.sensor_w = width
         self.sensor_h = height
-        self.cap = cv2.VideoCapture(device)
+        api = resolve_backend(backend)
+        self.cap = cv2.VideoCapture(device, api)
         if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open capture device {device}")
+            raise RuntimeError(
+                f"Could not open device {device} with backend '{backend}'. "
+                f"Try --backend dshow (Windows), msmf, any, or v4l2 (Linux)."
+            )
 
-        # CRITICAL: request raw YUYV at DOUBLE height, and disable RGB conversion so the
-        # radiometric half survives. Some backends ignore some of these — we verify below.
-        self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+        # Try to request raw YUYV at DOUBLE height and disable RGB conversion so the radiometric
+        # half survives. Some backends silently ignore these; we report what we actually got.
+        if raw_yuyv:
+            self.cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height * 2)
 
         actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"[gateway] capture opened: requested {width}x{height*2}, "
-              f"actual {actual_w}x{actual_h}")
+        print(f"[gateway] capture opened (backend={backend}): "
+              f"requested {width}x{height * 2}, actual {actual_w}x{actual_h}")
         if actual_h < height * 2:
             print("[gateway] WARNING: device did not provide the double-height frame. "
-                  "The radiometric half may be unavailable; check drivers / try --device N.")
+                  "Run with --probe to inspect the real frame, or try --backend dshow/msmf.")
 
     def read_celsius(self) -> np.ndarray | None:
         ok, frame = self.cap.read()
@@ -104,13 +134,11 @@ class GW192ACapture:
         return self._frame_to_celsius(frame)
 
     def _frame_to_celsius(self, frame: np.ndarray) -> np.ndarray:
-        """Interpret a raw YUYV buffer: bottom half holds 16-bit radiometric data.
+        """Interpret the raw buffer: the bottom half holds 16-bit radiometric data.
 
-        With CONVERT_RGB=0, OpenCV returns the YUYV bytes. We reinterpret them as uint16 to
-        recover the per-pixel radiometric counts. Layout details vary slightly by firmware; the
-        gateway exposes --byteswap / --half flags to adapt a specific unit.
+        With CONVERT_RGB=0 the buffer is raw YUYV; we reinterpret the bytes as little-endian
+        uint16 and take the bottom half (radiometric). Layout varies slightly by firmware.
         """
-        # Flatten to bytes then view as little-endian uint16.
         raw_bytes = np.ascontiguousarray(frame).tobytes()
         u16 = np.frombuffer(raw_bytes, dtype="<u2")
         total = self.sensor_w * self.sensor_h
@@ -147,17 +175,17 @@ async def stream(args: argparse.Namespace) -> None:
     url = f"{args.server.rstrip('/')}/ws/ingest/{args.session}"
     cap: GW192ACapture | None = None
     if not args.simulate:
-        cap = GW192ACapture(args.device, args.width, args.height)
+        cap = GW192ACapture(args.device, args.width, args.height, backend=args.backend)
 
     backoff = 1.0
     seq = 0
+    fail_streak = 0
     while True:
         try:
             async with websockets.connect(url, max_size=None) as ws:
                 print(f"[gateway] connected to {url}")
                 backoff = 1.0
-                # send initial control: palette + ROIs
-                await ws.send('{"palette": "medical"}')
+                await ws.send('{"palette": "medical"}')  # initial control
                 period = 1.0 / max(1, args.fps)
                 t0 = time.time()
                 while True:
@@ -166,14 +194,20 @@ async def stream(args: argparse.Namespace) -> None:
                     else:
                         celsius = cap.read_celsius()
                         if celsius is None:
+                            fail_streak += 1
+                            if fail_streak in (15, 75):
+                                print("[gateway] no se pueden leer frames de la cámara. "
+                                      "Prueba otro backend: --backend msmf  (o dshow/any), "
+                                      "y revisa --probe. ¿Está la app THG Start cerrada?")
                             await asyncio.sleep(period)
                             continue
+                        fail_streak = 0
                     if args.send_raw:
                         await ws.send(pack_radiometric_frame(celsius_to_raw(celsius), seq))
                     else:
                         await ws.send(pack_celsius_frame(celsius, seq))
                     seq += 1
-                    if seq % args.fps == 0:
+                    if seq % max(1, args.fps) == 0:
                         print(f"[gateway] sent {seq} frames "
                               f"(last max={float(celsius.max()):.1f}C)")
                     await asyncio.sleep(period)
@@ -181,18 +215,17 @@ async def stream(args: argparse.Namespace) -> None:
             print(f"[gateway] connection lost: {exc!r}; retrying in {backoff:.0f}s")
             await asyncio.sleep(backoff)
             backoff = min(30.0, backoff * 2)
-        finally:
-            if cap and False:  # keep camera open across reconnects
-                cap.release()
 
 
-def list_devices(max_index: int = 8) -> None:
+def list_devices(max_index: int = 8, backend: str = "auto") -> None:
     if cv2 is None:
         print("OpenCV not installed; cannot enumerate devices.")
         return
-    print("Probing video devices (a thermal cam often reports a doubled height, e.g. 192x384):")
+    api = resolve_backend(backend)
+    print(f"Probing video devices with backend '{backend}' "
+          f"(a thermal cam often reports a doubled height, e.g. 192x384):")
     for i in range(max_index):
-        cap = cv2.VideoCapture(i)
+        cap = cv2.VideoCapture(i, api)
         if cap.isOpened():
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -200,22 +233,69 @@ def list_devices(max_index: int = 8) -> None:
             cap.release()
 
 
+def probe_device(device: int, backend: str = "auto", attempts: int = 30) -> None:
+    """Open a device and report what frames it actually delivers (for diagnosis)."""
+    if cv2 is None:
+        print("OpenCV not installed; cannot probe.")
+        return
+    api = resolve_backend(backend)
+    print(f"[probe] opening device {device} with backend '{backend}'...")
+    cap = cv2.VideoCapture(device, api)
+    if not cap.isOpened():
+        print(f"[probe] FAILED to open device {device} with backend '{backend}'. "
+              f"Try --backend msmf / dshow / any.")
+        return
+    cap.set(cv2.CAP_PROP_CONVERT_RGB, 0.0)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    cc = "".join([chr((fourcc >> (8 * k)) & 0xFF) for k in range(4)])
+    print(f"[probe] reported size {w}x{h}, fourcc='{cc}'")
+    got = False
+    for k in range(attempts):
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            got = True
+            arr = np.asarray(frame)
+            print(f"[probe] frame OK on attempt {k + 1}: shape={arr.shape}, dtype={arr.dtype}, "
+                  f"bytes={arr.nbytes}, min={arr.min()}, max={arr.max()}")
+            u16 = np.frombuffer(np.ascontiguousarray(arr).tobytes(), dtype='<u2')
+            print(f"[probe] as uint16: count={u16.size}  "
+                  f"(192x192 half needs 36864; 256x192 half needs 49152)")
+            break
+        time.sleep(0.1)
+    if not got:
+        print(f"[probe] could NOT grab any frame in {attempts} attempts with backend "
+              f"'{backend}'. Try a different --backend, close other camera apps (THG Start), "
+              f"or replug the camera.")
+    cap.release()
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="GW192A desktop capture gateway")
     p.add_argument("--server", default="ws://localhost:8000", help="backend ws base URL")
     p.add_argument("--session", default="demo", help="session id to ingest into")
     p.add_argument("--device", type=int, default=0, help="UVC device index")
-    p.add_argument("--width", type=int, default=192, help="sensor width")
+    p.add_argument("--width", type=int, default=192, help="sensor width (single half)")
     p.add_argument("--height", type=int, default=192, help="sensor height (single half)")
     p.add_argument("--fps", type=int, default=12, help="frames/sec to send (<=25)")
+    p.add_argument("--backend", default="auto",
+                   choices=["auto", "dshow", "msmf", "any", "v4l2", "avfoundation"],
+                   help="OpenCV capture backend (auto picks dshow on Windows)")
     p.add_argument("--send-raw", action="store_true",
                    help="send radiometric uint16 instead of Celsius float32")
     p.add_argument("--simulate", action="store_true", help="emit a synthetic body (no hardware)")
     p.add_argument("--list", action="store_true", help="enumerate video devices and exit")
+    p.add_argument("--probe", action="store_true",
+                   help="open --device and report the real frame format, then exit")
     args = p.parse_args()
 
     if args.list:
-        list_devices()
+        list_devices(backend=args.backend)
+        return 0
+    if args.probe:
+        probe_device(args.device, backend=args.backend)
         return 0
     try:
         asyncio.run(stream(args))
