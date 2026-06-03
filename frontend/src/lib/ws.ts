@@ -4,6 +4,23 @@ import type { ProcessedFrame } from './thermal';
 
 const WS_BASE = process.env.NEXT_PUBLIC_WS_BASE || 'ws://localhost:8000';
 
+/**
+ * Demo mode: when no real backend is configured (e.g. the app is deployed to Netlify with
+ * NEXT_PUBLIC_DEMO=1, or there is simply no backend host), the UI runs a fully in-browser
+ * thermal demo so a phone can open the public URL and see ThermoBaby working without a server.
+ */
+export function isDemoMode(): boolean {
+  if (process.env.NEXT_PUBLIC_DEMO === '1') return true;
+  // Auto-enable demo if the configured WS host is localhost but the page is NOT on localhost
+  // (i.e. it was opened from a phone via a public URL where localhost is unreachable).
+  if (typeof window !== 'undefined') {
+    const onLocalhost = ['localhost', '127.0.0.1'].includes(window.location.hostname);
+    const wsLocal = WS_BASE.includes('localhost') || WS_BASE.includes('127.0.0.1');
+    if (!onLocalhost && wsLocal) return true;
+  }
+  return false;
+}
+
 export const KIND_RADIOMETRIC_U16 = 1;
 export const KIND_CELSIUS_F32 = 2;
 export const KIND_RGB_JPEG = 3;

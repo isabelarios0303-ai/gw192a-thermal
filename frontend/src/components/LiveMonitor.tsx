@@ -1,7 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { subscribeStream } from '@/lib/ws';
+import { isDemoMode, subscribeStream } from '@/lib/ws';
+import { startDemo } from '@/lib/demo';
 import { startCamera, stopStream } from '@/lib/camera';
 import { makeAlertGate, requestNotificationPermission } from '@/lib/alerts';
 import type { DisplayMode, PaletteName, ProcessedFrame } from '@/lib/thermal';
@@ -18,14 +19,30 @@ export function LiveMonitor({ sessionId = 'demo' }: { sessionId?: string }) {
   const [fusion, setFusion] = useState<FusionState>(DEFAULT_FUSION);
   const [frame, setFrame] = useState<ProcessedFrame | null>(null);
   const [status, setStatus] = useState<'open' | 'closed' | 'error'>('closed');
+  const [demo, setDemo] = useState(false);
   const [camOn, setCamOn] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const alertGate = useRef(makeAlertGate());
+  const paletteRef = useRef<PaletteName>(palette);
+  paletteRef.current = palette;
 
-  // subscribe to processed thermal frames
+  // Either subscribe to the real backend stream, or run the in-browser demo (e.g. on Netlify).
   useEffect(() => {
+    const useDemo = isDemoMode();
+    setDemo(useDemo);
+    if (useDemo) {
+      setStatus('open');
+      const stop = startDemo(
+        () => paletteRef.current,
+        (f) => {
+          setFrame(f);
+          if (f.alerts?.length) alertGate.current(f.alerts);
+        }
+      );
+      return stop;
+    }
     const dispose = subscribeStream(
       sessionId,
       (f) => {
@@ -72,7 +89,12 @@ export function LiveMonitor({ sessionId = 'demo' }: { sessionId?: string }) {
               className={`h-2 w-2 rounded-full ${status === 'open' ? 'bg-ok' : 'bg-crit'}`}
             />
             <span className="text-slate-400">
-              {status === 'open' ? 'Conectado' : 'Sin conexión'} · sesión {sessionId}
+              {demo
+                ? 'Modo demostración (en el navegador)'
+                : status === 'open'
+                  ? 'Conectado'
+                  : 'Sin conexión'}{' '}
+              · sesión {sessionId}
             </span>
           </div>
         </div>
@@ -94,8 +116,9 @@ export function LiveMonitor({ sessionId = 'demo' }: { sessionId?: string }) {
             {camOn ? 'Detener cámara RGB' : 'Activar cámara RGB'}
           </button>
           <div className="text-xs text-slate-400">
-            La cámara integrada habilita los modos RGB y Fusión. El stream térmico llega del
-            servidor (gateway / app puente / WebUSB).
+            {demo
+              ? 'Estás en modo demostración: el mapa térmico se genera en tu navegador, sin servidor. Activa la cámara para probar los modos RGB y Fusión con la cámara real de tu teléfono.'
+              : 'La cámara integrada habilita los modos RGB y Fusión. El stream térmico llega del servidor (gateway / app puente / WebUSB).'}
           </div>
         </div>
 

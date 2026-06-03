@@ -1,0 +1,21 @@
+# Netlify configuration for the ThermoBaby PWA (frontend).
+#
+# The site is a static export of the Next.js app (frontend/). When deployed it runs the
+# in-browser thermal demo (NEXT_PUBLIC_DEMO=1) so a phone can open the public URL and see
+# ThermoBaby working without any backend/gateway. The built-in RGB camera (RGB/Fusion modes)
+# also works because Netlify serves the site over HTTPS.
+
+[build]
+  base = "frontend"
+  command = "npm install && npm run build"
+  publish = "out"
+
+[build.environment]
+  NEXT_PUBLIC_DEMO = "1"
+  NODE_VERSION = "20"
+
+# SPA-style fallback for client-side routes.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
